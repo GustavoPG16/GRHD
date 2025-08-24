@@ -1,7 +1,7 @@
 ! ================================================================================
 !                             General Relativity Hydrodinamics 
 ! Este programa resuelve las ecuaciones de GRHD unidimensional usando la métrica
-! de Shwarzschild en coordenadas Eddington Finkestein (ED) usando la composición
+! de Shwarzschild en coordenadas de Eddington Finkestein (EF) usando la descomposición
 ! 3+1, usando el método de flujos HLLE 
 ! =================================================================================
 
@@ -10,1246 +10,875 @@
 ! Variables: Este modulo contiene las variables globales que utilizaremos 
 !            a lo largo de este código
 !  -------------------------------------------------------------------------
+
+
 module variables
-    implicit none
-    
-    ! --- Índices de ecuaciones ---
-    integer :: eq_de = 1   
-    integer :: eq_pr = 2   
-    integer :: eq_vx = 3    
-    integer, parameter :: neq = 3     ! Número total de ecuaciones
+  implicit none
+  public
 
-    ! --- Dominio numérico  --- 
-    real*8 :: xmin, xmax, dx, CFL, t, dt, final_time
-    integer :: Nx, Nt
-    integer :: t1, t2
+  ! --- Índices de ecuaciones ---
+  integer, parameter :: neq = 3   ! equations: 1=de,2=pr,3=vx,4=vy (vy no usada en 1D)
+  integer :: eq_de = 1
+  integer :: eq_pr = 2
+  integer :: eq_vx = 3
 
-    ! --- Arrays principales ---
-    real*8, allocatable :: x(:)              ! posiciones
-    real*8, allocatable :: u(:,:)            ! variables conservativas
-    real*8, allocatable :: up(:,:)           ! variables conservativas actualizadas
-    real*8, allocatable :: p(:,:)            ! variables primitivas
-    real*8, allocatable :: fx(:,:)           ! flujos
-    real*8, allocatable :: rhs(:,:)          ! término fuente
-    real*8, allocatable :: pLx(:,:), pRx(:,:) ! estados reconstruidos
+  ! --- Dominio numérico---
+  integer :: nx
+  real*8 :: x_min, x_max, dx, t, dt, final_time
+  real*8 :: CFL      ! Número de Courant-Friedrichs-Lewy
 
-    ! --- Geometría de Schwarzschild en coordenadas EF ---
-    real*8, allocatable :: grr(:)        ! Componente radial de la métrica
-    real*8, allocatable :: alpha(:)      ! Función lapso
-    real*8, allocatable :: dlnalpha(:)   ! Derivada del logaritmo lapso
-    real*8, allocatable :: beta(:)     ! Vector shift
-    real*8, allocatable :: detgamma(:) ! Determinante de la métrica espacial
+  ! --- Arrays principales ---
+  real*8, allocatable :: x(:)             ! Posiciones de los centros de las celdas
+  real*8, allocatable :: u(:,:)           ! Variables conservativas
+  real*8, allocatable :: up(:,:)          ! Variables conservatidas actualizadas 
+  real*8, allocatable :: p(:,:)           ! Variables primitivas  
+  real*8, allocatable :: fx(:,:)          ! Flujos en dirección x
+  real*8, allocatable :: s(:,:)           ! Fuentes 
+  real*8, allocatable :: rhs(:,:)         ! Términos de la derecha
+  real*8, allocatable :: pL(:,:), pR(:,:) ! Variables primitivas reconstruidas
 
-    ! --- Parámetros físicos ---
-    real*8 :: rho_ini    ! Densidad inicial
-    real*8 :: v_infty    ! Velocidad en el infinito
-    real*8 :: cs_infty   ! Velocidad del sonido en el infinito
-    real*8 :: gam        ! Indice adiabático  
-    real*8 :: Ma         ! Masa del agujero negro
+  ! --- Geometría de Schwarzschild en coordenadas EF ---
+  ! real*8, allocatable :: grr(:)        ! Componente radial de la métrica
+  ! real*8, allocatable :: alpha(:)      ! Función lapso
+  ! real*8, allocatable :: dlnalpha(:)   ! Derivada del logaritmo del lapso
+  ! real*8, allocatable :: beta(:)       ! Vector shift
+  ! real*8, allocatable :: detgamma(:)   ! Determinante de la métrica espacial
+  ! real*8, allocatable :: gamma(:,:,:)  ! Simbolos de Christoffel - gamma^a_{bc}
 
-    ! --- Método numérico ---
-    character(len=10) :: reconstruction_method  ! Método de reconstrucción
-    real*8 :: floor                      ! Valor mínimo para densidad/presión
+  !-- Parámetros físicos  ---
+  real*8 :: adb_idx  ! Índice adiabático
+  real*8 :: g1       ! Factor de compresión adiabática 
+  real*8 :: Ma       ! Masa del agujero
 
-    ! --- Output ---
-    character(len=100) :: output_dir = 'output/'
-    character(len=100) :: output_prefix
+  ! --- Método de reconstrucción ---
+  character(len=10) :: reconstruction_method ! Método de reconstrucción seleccionado (Godunov, TVD)
+  character(len=10) :: tvd_limiter           ! Limiter para el método TVD (Minmod, Superbee, MC)
+
+  ! --- Output ---
+  character(len=50) :: output_prefix, output_folder
+
+  ! --- Variables de guardado ---
+  real*8 :: save_interval 
+  real*8 :: last_save_time = 0.0d0
+  real*8 :: next_save_time
+
+  ! --- Variables de condición inicial ---
+  character(len=50) :: cond_ini  ! Condición inicial seleccionada
+
 end module variables
-
 
 ! ---------------------------------------------------------------------------------------
 ! Metrics: en este modulo implementamos la métrica de Schwarzschild para un agujero negro 
-!          no rotante en coordenadas ED, implementamos su respectiva descomposición 3+1.
+!          no rotante en coordenadas EF, implementamos su respectiva descomposición 3+1.
 !          Agregamos los simbolos de Christoffel, los tesores energía momento no nulos, 
-!          respectivamente.Tambien calculamos los términos fuentes S.
+!          respectivamente. Tambien calculamos los términos fuentes S.
 ! ---------------------------------------------------------------------------------------
 module metrics
-    use variables
-    implicit none
-    private
-    public :: set_metric, calculate_schwarzschild_EF, calculate_geometric_sources, &
-              calculate_stress_energy_tensor
+  use variables
+  implicit none
+  private
+  public :: calculate_metric, calculate_christoffel_symbols, calculate_stress_energy_tensor
+  ! public :: set_metric, calculate_schwarzschild_EF
 
 contains
-    ! Elegir la métrica
-    subroutine set_metric(x, grr, alpha, dlnalpha, beta, detgamma, metric_type)
-        implicit none
-        real(kind=8), intent(in) :: x(:)
-        real*8, intent(out) :: grr(:)
-        real*8, intent(out) :: alpha(:), dlnalpha(:)
-        real*8, intent(out) :: beta(:)
-        real*8, intent(out) :: detgamma(:)
-        character(len=*), intent(in) :: metric_type
+  ! Elegir la métrica
+  ! subroutine set_metric(xi, grr, alpha, dlnalpha, beta, detgamma, metric_type)
+  !   implicit none
+  !   real*8, intent(in) :: xi(:)
+  !   real*8, intent(out) :: grr(:), alpha(:), dlnalpha(:)
+  !   real*8, intent(out) :: beta(:), detgamma(:)
+  !   character(len=*), intent(in) :: metric_type
 
-        select case(trim(metric_type))
-           case('Schwarzschild_EF')
-                call calculate_schwarzschild_EF(x, grr, alpha, dlnalpha, &
-                                             beta, detgamma)
-       end select
-    end subroutine set_metric
+  !   select case(trim(metric_type))
+  !     case('Schwarzschild_EF')
+  !       call calculate_schwarzschild_EF(xi, grr, alpha, dlnalpha, beta, detgamma)
+  !     end select
+  !   end subroutine set_metric
 
     ! Métrica de Schwarzschild en coordenadas ED
-    subroutine calculate_schwarzschild_EF(x, grr, alpha, dlnalpha, beta, detgamma)
-        implicit none
-        real*8, intent(in) :: x(:)
-        real*8, intent(out) :: grr(:) 
-        real*8, intent(out) :: alpha(:), dlnalpha(:)
-        real*8, intent(out) :: beta(:)
-        real*8, intent(out) :: detgamma(:)
+    subroutine calculate_metric(ri, grr, alpha, dlnalpha, beta, detgamma, gthth, gphph)
+      implicit none
+      real*8, intent(in) :: ri
+      real*8, intent(out), optional :: grr, alpha, dlnalpha, beta, detgamma, gthth, gphph
 
-        ! Métrica de Schwarzschild en coordenadas EF
-        alpha = 1.0d0 / sqrt(1.0d0 + 2.0d0 * Ma / x)
-        dlnalpha = Ma / (x**2 + 2.0d0 * Ma * x)
-        
-        beta = 2.0d0 * Ma / x / (1.0d0 + 2.0d0 * Ma / x)
-        
-        grr = 1.0d0 + 2.0d0 * Ma / x
-        
-        detgamma = x**4 * grr
-    end subroutine calculate_schwarzschild_EF
+      ! Métrica de Schwarzschild en coordenadas EF
+      if (present(alpha))     alpha = 1.0d0 / sqrt(1.0d0 + 2.0d0 * Ma / ri)      ! alpha
+      if (present(dlnalpha))  dlnalpha = Ma / (ri**2 + 2.0d0 * Ma * ri)          ! d(ln(alpha))/dr
+      if (present(beta))      beta = 2.0d0 * Ma / ri / (1.0d0 + 2.0d0 * Ma / ri) ! beta^r
+      if (present(grr))       grr = 1.0d0 + 2.0d0 * Ma / ri                      ! g_rr = gamma_rr
+      if (present(detgamma))  detgamma = ri**4 * grr                             ! Determinante de la métrica espacial sqrt(gamma)
+      if (present(gthth))     gthth = ri**2                                      ! g_thth
+      if (present(gphph))     gphph = gthth                                      ! g_phph
+    end subroutine calculate_metric
+
+    ! ! Métrica de Schwarzschild en coordenadas ED
+    ! subroutine calculate_schwarzschild_EF(xi, grr, alpha, dlnalpha, beta, detgamma)
+    !   implicit none
+    !   real*8, intent(in) :: xi
+    !   real*8, intent(out), dimension(:) :: grr, alpha, dlnalpha, beta, detgamma
+
+    !   ! Métrica de Schwarzschild en coordenadas EF
+    !   alpha = 1.0d0 / sqrt(1.0d0 + 2.0d0 * Ma / x)     ! alpha
+    !   dlnalpha = Ma / (x**2 + 2.0d0 * Ma * x)          ! d(ln(alpha))/dr
+    !   beta = 2.0d0 * Ma / x / (1.0d0 + 2.0d0 * Ma / x) ! beta^r
+    !   grr = 1.0d0 + 2.0d0 * Ma / x                     ! g_rr = gamma_rr
+    !   detgamma = x**4 * grr                            ! Determinante de la métrica espacial sqrt(gamma)
+    ! end subroutine calculate_schwarzschild_EF
 
     ! Componentes del tensor energía momento
-    subroutine calculate_stress_energy_tensor(rho, press, v, W, h, i, T00, Tr0, Trr)
-        implicit none
-        real*8, intent(in) :: rho, press, v, W, h
-        integer, intent(in) :: i
-        real*8, intent(out) :: T00, Tr0, Trr
+    subroutine calculate_stress_energy_tensor(q, ri, T00, Tr0, Trr, Tthth, Tphph)
+      implicit none
+      real*8, intent(in) :: q(:), ri
+      real*8, intent(out) :: T00, Tr0, Trr, Tthth, Tphph
+      real*8 :: grr, alpha, beta
+      real*8 :: vv, h, W, v
 
-        ! Componentes del tensor energía-momento
-        T00 = (rho * h * W**2 - press) / alpha(i)**2
-        Tr0 = rho * h * W**2 / alpha(i) * (v - beta(i)/alpha(i)) + &
-              press * beta(i) / alpha(i)**2
-        Trr = rho * h * W**2 * (v - beta(i)/alpha(i))**2 + &
-              press * (1.0d0/grr(i) - beta(i)**2/alpha(i)**2)
+      ! q = Variables primitivas
+      ! ri = posición de la celda actual
+      ! T** = Componentes del tensor energía-momento
+
+      call calculate_metric(ri, grr=grr, alpha=alpha, beta=beta)
+
+      vv = q(eq_vx)**2 * grr
+      h = 1.0d0 + g1 * q(eq_pr) / q(eq_de)
+      W = 1.0d0 / sqrt(1.0d0 - vv)
+      v = q(eq_vx) - beta / alpha! Velocidad relativa
+
+      ! Componentes del tensor energía-momento
+      T00 = (q(eq_de) * h * W**2 - q(eq_pr)) / alpha**2 !u(eq_pr)/alpha^2
+      Tr0 = q(eq_de) * h * W**2 / alpha * v + q(eq_pr) * beta / alpha**2
+      Trr = q(eq_de) * h * W**2 * v**2 + q(eq_pr) * (1/grr - beta**2/alpha**2)
+      Tthth = q(eq_pr)/ri**2
+      Tphph = Tthth ! En 1D, Tthth = Tphph
     end subroutine calculate_stress_energy_tensor
 
     ! Simbolos de Christoffel
-    subroutine calculate_geometric_sources(i, T00, Tr0, Trr, source)
-        implicit none
-        integer, intent(in) :: i
-        real*8, intent(in) :: T00, Tr0, Trr
-        real*8, intent(out) :: source(neq)
-        ! Notación {xyz}={xy}^z
-        real*8 :: Gamma0r0, Gamma0rr, Gammarrr, Gammarr0, Gammathrth, Gammaphrph
-        real*8 :: Gamma000, Gammathth0, Gammaphph0
-        !real*8 :: x_safe  ! Solo para proteger divisiones
+    subroutine calculate_christoffel_symbols(ri, chr)
+      implicit none
+      real*8, intent(in) :: ri
+      real*8, intent(out) :: chr(0:3,0:3,0:3) !Notacion gamma^a_{bc}
 
-        ! Proteger x cerca del horizonte
-        !x_safe = max(x(i), 2.001d0 * Ma)
+      ! ri = posición de la celda actual
+      ! chr = Simbolos de Christoffel
 
-	! --- Simbolos de Christoffel
-        Gamma0r0 = Ma / x(i)**2 * (1.0d0 + 2.0d0 * Ma / x(i))
-        Gamma0rr = -2.0d0 * Ma**2 / x(i)**3
-        Gammarrr = -Ma/ x(i)**2 * (1.0d0 + 2.0d0 * Ma / x(i))
-        Gammarr0 = 2.0d0 * Ma / x(i)**2 * (1.0d0 + Ma / x(i))
-        Gammathrth = 1.0d0 / x(i)
-        Gammaphrph = 1.0d0 / x(i)
-        Gamma000 = 2.0d0 * Ma**2 / x(i)**3
-        Gammathth0 = -2.0d0 * Ma
-        Gammaphph0 = -2.0d0 * Ma !* sin^2(theta)
+      chr = 0.0d0 ! Inicializa los Christoffel a cero
 
-        ! --- Terminos Fuente
-        ! Ecuación de continuidad
-        source(1) = 0.0d0  
-        ! Ecuación de momento 
-        source(2) = T00 * ((-alpha(i)**2 + grr(i)*beta(i)**2)*Gamma0r0 + grr(i)*beta(i)*Gamma0rr) + &
-                    Tr0 * ((-alpha(i)**2 + grr(i)*beta(i)**2)*Gamma0r0 * grr(i)*Gammarrr + &
-                    grr(i)*beta(i)*(Gammarr0 + Gamma0r0)) + &
-                    Trr *(grr(i)*Gammarrr + grr(i)*beta(i)*Gammarr0) 
-        ! Ecuación de energíaa
-        source(3) = alpha(i) * (- T00 * Gamma000 + Tr0 * (dlnalpha(i) - 2.0d0 * Gamma0r0) - &
-                    Gammarr0 * Trr)
-                    
-        ! Multiplicar por factores globales
-         source(:) = alpha(i) * sqrt(detgamma(i)) * source(:)
-    end subroutine calculate_geometric_sources
+      ! Simbolos de Christoffel para la métrica de Schwarzschild en coordenadas EF
+      chr(0,0,0) = 2.0d0 * Ma**2 / ri**3
+      chr(0,0,1) = Ma * (1.0d0 + 2.0d0 * Ma / ri) / ri**2
+      chr(0,1,1) = 2.0d0 * Ma * (1.0d0 + Ma / ri) / ri**2
+      chr(1,0,0) = Ma / ri**2 * (1.0d0 - 2.0d0 * Ma / ri)
+      chr(1,0,1) = -chr(0,0,0)
+      chr(1,1,1) = -chr(0,0,1)
+      chr(2,1,2) = 1.0d0 / ri
+      chr(3,1,3) = chr(2,1,2)
+      chr(0,2,2) = -2.0d0 * Ma
+      chr(0,3,3) = chr(0,2,2)
+      chr(1,2,2) = 2.0d0 * Ma - ri
+    end subroutine calculate_christoffel_symbols
 
 end module metrics
 
-! ---------------------------------------------------------------------------------------
-! MODFluxes: Esta subrutina implementa el cálculo del flujo numérico en un esquema de 
-!            Godunov usando el solver aproximado HLLE en relatividad general 1D. También
-!            se calculan los eigenvalores.
-! ---------------------------------------------------------------------------------------
-module MODfluxes
-    use variables
-    use metrics
+module conditions
+  use variables
+  use metrics
+  implicit none
+  private
+  public :: initial_conditions, boundary_conditions
+
+  contains
+
+  subroutine initial_conditions()
+    integer :: i
+    real*8  :: rho_ini  = 1.0d-4 ! Densidad inicial
+    real*8  :: v_infty  = -0.2d0 ! Velocidad del flujo asintótico
+    real*8  :: cs_infty = 0.1d0  ! Velocidad del sonido asintótica
+    real*8  :: grr
+
+    select case(trim(cond_ini))
+    case("1")
+
+      do i = 0, nx
+        call calculate_metric(x(i), grr=grr)
+        p(eq_de,i) = rho_ini
+        p(eq_vx,i) = v_infty/sqrt(grr)
+        p(eq_pr,i) = rho_ini * cs_infty**2 / (adb_idx - cs_infty**2*g1)
+      end do
+
+    ! case("2") ! Bondi Hoyle accretion
+    !   p(eq_de) = 1.0d0
+    !   do i = 1, nx
+    !     p(eq_vx) = v_infty/sqrt(grr)
+    !     p(eq_pr) = 1.0d0 * cs_infty**2 / (adb_idx - cs_infty**2*g1)
+    !   end do
+    end select
+
+  end subroutine initial_conditions
+
+  subroutine boundary_conditions(q)
     implicit none
-    private
-    public :: fluxes, compute_eigenvalues
+    real*8, intent(inout) :: q(neq, -1:nx+1)
+    integer :: i
+
+    ! Extrapolación lineal en la frontera interna (i=0,-1)
+    q(:,0) = 3.0d0*q(:,1) - 3.0d0*q(:,2) + q(:,3)
+    ! q(:,-1) = 3.0d0*q(:,0) - 3.0d0*(q(:,1) + q(:,2))
+
+    ! Extrapolación simple en la frontera externa (i=nx+1, nx+2)
+    ! q(:,nx+1) = q(:,nx)
+    ! q(:,nx+2) = q(:,nx-1)
+
+    ! Condición de frontera en la frontera externa (i=nx)
+    ! rhs(Nx) = 0.0d0 -- Inyección permanente
+
+  end subroutine boundary_conditions
+
+end module conditions
+
+module initialization
+  use variables
+  use metrics
+  use conditions
+  implicit none
 
 contains
-    subroutine fluxes(pl, pr, f, alpha_local, beta_local, grr_local, det_gamma)
-        real(kind=8), intent(in)  :: pl(neq), pr(neq)
-        real(kind=8), intent(in)  :: alpha_local, beta_local, grr_local, det_gamma
-        real(kind=8), intent(out) :: f(neq)
-        real(kind=8) :: ul(neq), ur(neq), fl(neq), fr(neq)  
-        real(kind=8) :: ap, am, cflmin, cflmax, cfrmin, cfrmax
 
-        ! Calcular flujos físicos
-        call compute_flux(pl, fl, alpha_local, beta_local, grr_local, det_gamma)
-        call compute_flux(pr, fr, alpha_local, beta_local, grr_local, det_gamma)
+  subroutine choose_reconstruction_method()
+    integer :: choice, choice_limiter
 
-        ! Convertir a conservativas
-        call compute_conservatives(pl, ul, grr_local, det_gamma)
-        call compute_conservatives(pr, ur, grr_local, det_gamma)
+    ! print *, "Choose reconstruction method:"
+    ! print *, "1. Godunov (1st order)"
+    ! print *, "2. TVD (2nd order)"
+    ! read *, choice
+    choice = 1 ! Descomentar para entrada manual
 
-        ! Calcular velocidades características
-        call compute_eigenvalues(pl, cflmin, cflmax, alpha_local, beta_local, grr_local)
-        call compute_eigenvalues(pr, cfrmin, cfrmax, alpha_local, beta_local, grr_local)
+    select case(choice)
+    case(1)
+      reconstruction_method = 'Godunov'
+    case(2)
+      reconstruction_method = 'TVD'
+      ! print *, "Choose TVD limiter:"
+      ! print *, "1. Minmod"
+      ! print *, "2. Superbee"
+      ! print *, "3. Monotonized Centered"
+      ! read *, choice_limiter
+      choice_limiter = 1
 
-        ! Velocidades de onda para HLLE
-        ap = max(0.0d0, cflmax, cfrmax)
-        am = min(0.0d0, cflmin, cfrmin)
+      select case(choice_limiter)
+      case(1)
+        tvd_limiter = 'minmod'
+      case(2)
+        tvd_limiter = 'superbee'
+      case(3)
+        tvd_limiter = 'mc'
+      case default
+        print *, "Invalid choice. Using minmod."
+        tvd_limiter = 'minmod'
+      end select
+    case default
+      print *, "Invalid choice. Using default method (TVD - Minmod)."
+      reconstruction_method = 'TVD'
+      tvd_limiter = 'minmod'
+    end select
 
-        ! Flujo HLLE
-        if (abs(ap - am) > 1.0d-12) then
-            f(:) = (ap*fl(:) - am*fr(:) + ap*am*(ur(:) - ul(:)))/(ap - am)
-        else
-            f(:) = 0.5d0*(fl(:) + fr(:))
-        end if
-    end subroutine fluxes
-
-    subroutine compute_flux(p_local, f_local, alpha_local, beta_local, grr_local, detgamma)
-        real(kind=8), intent(in)  :: p_local(neq)
-        real(kind=8), intent(in)  :: alpha_local, beta_local, grr_local, detgamma
-        real(kind=8), intent(out) :: f_local(neq)
-        real(kind=8) :: u_local(neq), v
-
-        ! Convertir a variables conservativas
-        call compute_conservatives(p_local, u_local, grr_local, detgamma)
-        v = p_local(eq_vx)  ! Velocidad
-
-        ! Flujos 
-        f_local(eq_de) = alpha_local * (v - beta_local/alpha_local) * u_local(eq_de)
-        f_local(eq_pr) = alpha_local * (v - beta_local/alpha_local) * u_local(eq_pr) + &
-                         alpha_local * sqrt(detgamma) * p_local(eq_pr)
-        f_local(eq_vx) = alpha_local * (v - beta_local/alpha_local) * u_local(eq_vx) + &
-                         alpha_local * sqrt(detgamma) * v * p_local(eq_pr)
-    end subroutine compute_flux
-
-    subroutine compute_conservatives(p_local, u_local, grr_local, detgamma)
-        real(kind=8), intent(in)  :: p_local(neq)
-        real(kind=8), intent(in)  :: grr_local, detgamma
-        real(kind=8), intent(out) :: u_local(neq)
-        real(kind=8) :: W, h, v, rho, press, sqrt_detgamma
-        real(kind=8) :: v2, W2, e_internal
-        real(kind=8), parameter :: eps = 1.0d-12
-        real(kind=8), parameter :: v_max = 0.99d0
-
-        ! Extraer primitivas con protección
-        rho = max(p_local(eq_de), eps)
-        press = max(p_local(eq_pr), eps)
-        v = p_local(eq_vx)
-    
-        ! Proteger grr_local y detgamma
-        sqrt_detgamma = sqrt(max(detgamma, eps))
-    
-        ! Limitar velocidad
-        v2 = v * v
-        if (grr_local * v2 >= 1.0d0) then
-            v = sign(v_max, v)
-            v2 = v * v
-        end if
-    
-        ! Factor de Lorentz con protección
-        W2 = 1.0d0 / max(eps, 1.0d0 - grr_local * v2)
-        W = sqrt(W2)
-    
-        ! Verificar W físico
-        if (W > 100.0d0) then  ! Límite práctico
-            W = 100.0d0
-            W2 = W * W
-            v = sign(sqrt((W2 - 1.0d0) / (W2 * grr_local)), v)
-        end if
-    
-        ! Entalpía específica con protección
-        e_internal = press / ((gam - 1.0d0) * rho)
-        h = 1.0d0 + e_internal + press / rho
-        h = max(h, 1.0d0 + eps)
-    
-        ! Variables conservativas con protección
-        u_local(eq_de) = sqrt_detgamma * rho * W
-        u_local(eq_pr) = sqrt_detgamma * rho * h * W2 * grr_local * v
-        u_local(eq_vx) = sqrt_detgamma * (rho * h * W2 - press - rho * W)
-    
-       ! Verificación de sanidad
-       if (any(abs(u_local) > 1.0d10)) then
-            u_local(eq_de) = sqrt_detgamma * rho
-            u_local(eq_pr) = sqrt_detgamma * rho * v
-            u_local(eq_vx) = sqrt_detgamma * press / (gam - 1.0d0)
-       end if
-    
-    end subroutine compute_conservatives
-
-    subroutine compute_eigenvalues(p_local, lambda_min, lambda_max, alpha_local, beta_local, grr_local)
-        real(kind=8), intent(in)  :: p_local(neq)
-        real(kind=8), intent(in)  :: alpha_local, beta_local, grr_local
-        real(kind=8), intent(out) :: lambda_min, lambda_max
-        real(kind=8) :: cs, v, lambda1, lambda2, lambda3
-        real(kind=8) :: a, b, c, discriminant, sqrt_disc
-        real(kind=8), parameter :: eps = 1.0d-12
-        real(kind=8), parameter :: v_max = 0.99d0
-    
-        v = p_local(eq_vx)
-    
-        ! Limitar velocidad a valores físicos
-        v = sign(min(abs(v), v_max), v)
-    
-        ! Velocidad del sonido con protección completa
-        if (p_local(eq_de) > eps .and. p_local(eq_pr) > eps) then
-           cs = sqrt(gam * p_local(eq_pr) * (gam - 1.0d0) / &
-                 max(eps, p_local(eq_pr) * gam + p_local(eq_de) * (gam - 1.0d0)))
-           cs = min(cs, sqrt(1.0d0 - eps))
-        else
-           cs = 0.1d0  ! Valor por defecto seguro
-        end if
-    
-        ! Eigenvalue de la ecuación de continuidad
-        lambda1 = alpha_local * v - beta_local
-    
-        ! Coeficientes de la ecuación cuadrática para eigenvalues acústicos
-        ! Usando la forma estándar: a*lambda² + b*lambda + c = 0
-        a = 1.0d0 - cs * cs
-        b = -2.0d0 * alpha_local * v * (1.0d0 - cs * cs)
-        c = alpha_local * alpha_local * (v * v - cs * cs * max(eps, 1.0d0 - grr_local * v * v))
-    
-        ! Resolver ecuación cuadrática de manera robusta
-        if (abs(a) < eps) then
-           ! Ecuación lineal
-           if (abs(b) > eps) then
-               lambda2 = -c / b
-               lambda3 = lambda2
-           else
-               lambda2 = lambda1
-               lambda3 = lambda1
-           end if
-        else
-           discriminant = b * b - 4.0d0 * a * c
-           if (discriminant < 0.0d0) then
-               lambda2 = lambda1
-               lambda3 = lambda1
-           else
-               sqrt_disc = sqrt(discriminant)
-               lambda2 = (-b + sqrt_disc) / (2.0d0 * a)
-               lambda3 = (-b - sqrt_disc) / (2.0d0 * a)
-           end if
-       end if
-    
-      ! Aplicar shift
-       lambda2 = lambda2 - beta_local
-       lambda3 = lambda3 - beta_local
-    
-       lambda_min = min(lambda1, lambda2, lambda3)
-       lambda_max = max(lambda1, lambda2, lambda3)
-    
-       ! Verificación final
-       if (abs(lambda_max - lambda_min) < eps) then
-           lambda_max = lambda_min + eps
-       end if
-    
-    end subroutine compute_eigenvalues
-
-end module MODfluxes
+    ! print *, "Selected reconstruction method: ", trim(reconstruction_method)
+  end subroutine choose_reconstruction_method
 
 
-! ---------------------------------------------------------------------------------------
-! boundary_conditions: Gestiona los valores en las zonas fantasma y en los bordes del 
-!                     dominio, usando extrapolación polinómicas para mantener la coherencia 
-!                     física cerca de la frontera interna (como el horizonte de unBH) y 
-!                     condiciones de salida en la frontera externa.
-! ---------------------------------------------------------------------------------------
-module boundary_conditions
-    use variables
+  subroutine initialize_problem()
+    integer :: i
+    character(len=50) :: case_choice
+
+    ! print *, "Select test case:"
+    ! print *, "1. Michel Accretion"
+    ! print *, "2. Bondi Hoyle"
+    ! read *, case_choice
+    case_choice = "1" ! Descomentar para entrada manual
+    cond_ini = case_choice
+
+    select case(cond_ini)
+    case("1")
+      call init_MichelAccretion()
+    ! case("2")
+    !   call init_BondiHoyle()
+    case default
+      print *, "Invalid selection. Exiting."
+      stop
+    end select
+
+    g1 = adb_idx / (adb_idx - 1d0)
+
+    dx = (x_max - x_min) / nx
+
+    ! Inicializa la malla
+    allocate(x(0:nx)) ! Puntos centrales de las celdas
+
+    !$OMP PARALLEL DO PRIVATE(i)
+    do i = 0, nx
+      x(i) = x_min + dx*i 
+    end do
+    !$OMP END PARALLEL DO
+
+    ! Asigna memoria para arrays
+    allocate(u(neq,-1:nx+1))
+    allocate(up(neq,-1:nx+1))
+    allocate(p(neq,-1:nx+1))
+    allocate(fx(neq,-1:nx+1))
+    allocate(s(neq,-1:nx+1))
+    allocate(rhs(neq,-1:nx+1))
+    allocate(pL(neq,-1:nx+1))
+    allocate(pR(neq,-1:nx+1))
+
+    ! ! Inicializa la métrica
+    ! call set_metric(x, grr, alpha, dlnalpha, beta, detgamma, 'Schwarzschild_EF')
+
+    ! Create output folder if it doesn't exist
+    call system('mkdir -p ' // trim(output_folder))
+    ! Create subfolders for each reconstruction method
+    call system('mkdir -p ' // trim(output_folder) // '/Godunov')
+    call system('mkdir -p ' // trim(output_folder) // '/TVD')
+
+    ! Set initial conditions
+    call initial_conditions()
+
+    ! Set reconstruction method
+    call choose_reconstruction_method()
+
+  end subroutine initialize_problem
+
+  subroutine init_MichelAccretion()
+    ! Initialize parameters for Michel Accretion
+    nx = 1000
+    x_min = 1.0d0
+    x_max = 51.0d0
+    adb_idx = 4.0d0/3.0d0
+    Ma = 1.0d0
+    final_time = 500.0d0
+    output_prefix = 'MA'
+    output_folder = 'MichelAccretion/'
+    CFL = 0.25d0
+    save_interval = 50.0d0
+  end subroutine init_MichelAccretion
+
+  ! subroutine init_BondiHoyle()
+  !   ! Initialize parameters for Bondi Hoyle accretion
+  !   nx = 100
+  !   x_min = 1.0d0
+  !   x_max = 10.0d0
+  !   adb_idx = 5.0d0/3.0d0
+  !   final_time = 1.0d0
+  !   output_prefix = 'BondiHoyle'
+  !   output_folder = 'output/BondiHoyle'
+  !   CFL = 0.5d0
+  !   save_interval = 0.1d0
+  ! end subroutine init_BondiHoyle
+end module initialization
+
+module reconstruction
+  use variables
+  implicit none
+  private
+  public :: reconstruct_variables
+
+  contains
+
+  real*8 function minmod(a,b)
     implicit none
-    private
-    public :: apply_boundary_conditions, apply_inner_boundary
+    real*8, intent(in) :: a, b
+    minmod = 0.5d0 * (sign(1.0d0,a) + sign(1.0d0,b)) * min(abs(a),abs(b))
+  end function minmod
 
-contains
-    ! Subrutina que aplica condiciones de frontera
-    subroutine apply_boundary_conditions(q)
-        implicit none
-        real(kind=8), intent(inout) :: q(neq,-1:nx+2)
-        
-        ! Frontera interna (horizonte) - extrapolación cúbica
-        q(eq_de,0)  = 3.0d0 * q(eq_de,1) - 3.0d0 * q(eq_de,2) + q(eq_de,3)
-        q(eq_pr,0)  = 3.0d0 * q(eq_pr,1) - 3.0d0 * q(eq_pr,2) + q(eq_pr,3)
-        q(eq_vx,0)  = 3.0d0 * q(eq_vx,1) - 3.0d0 * q(eq_vx,2) + q(eq_vx,3)
-
-        ! Completar dominio fantasma - extrapolación lineal
-        q(eq_de,-1) = 2.0d0 * q(eq_de,0) - q(eq_de,1)
-        q(eq_pr,-1) = 2.0d0 * q(eq_pr,0) - q(eq_pr,1)
-        q(eq_vx,-1) = 2.0d0 * q(eq_vx,0) - q(eq_vx,1)
-
-        ! Frontera externa 
-        q(:,nx+1) = q(:,nx)
-        q(:,nx+2) = q(:,nx+1)
-    end subroutine apply_boundary_conditions
-
-    ! condiciones internas
-    subroutine apply_inner_boundary(q)
-        implicit none
-        real(kind=8), intent(inout) :: q(neq,-1:nx+2)
-        
-        ! Solo condiciones de frontera interna
-        q(eq_de,0)  = 3.0d0 * q(eq_de,1) - 3.0d0 * q(eq_de,2) + q(eq_de,3)
-        q(eq_pr,0)  = 3.0d0 * q(eq_pr,1) - 3.0d0 * q(eq_pr,2) + q(eq_pr,3)
-        q(eq_vx,0)  = 3.0d0 * q(eq_vx,1) - 3.0d0 * q(eq_vx,2) + q(eq_vx,3)
-
-        q(eq_de,-1) = 2.0d0 * q(eq_de,0) - q(eq_de,1)
-        q(eq_pr,-1) = 2.0d0 * q(eq_pr,0) - q(eq_pr,1)
-        q(eq_vx,-1) = 2.0d0 * q(eq_vx,0) - q(eq_vx,1)
-    end subroutine apply_inner_boundary
-
-end module boundary_conditions
-
-! ----------------------------------------------------------------------------------
-! Eqaurions: Este módulo gestiona las ecuaciones principales del HD en 1D, incluyen
-!            la conversión entre variables, reconstrucción espacial, integración 
-!            temporal y limitadores numéricos.
-! ---------------------------------------------------------------------------------
-module equations
-    use variables
-    use metrics
-    use MODfluxes, only: fluxes
-    use boundary_conditions, only: apply_inner_boundary
+  real*8 function minmod3(a,b,c)
     implicit none
-    private
-    public :: primu, uprim, reconstruct_variables, minmod, advance_solution
+    real*8, intent(in) :: a,b,c
+    minmod3 = sign(1.0d0,a) * max(0.0d0, min(abs(a), sign(1.0d0,a)*b, sign(1.0d0,a)*c))
+  end function minmod3
 
-contains
-    real*8 function minmod(a, b)
-        implicit none
-        real*8, intent(in) :: a, b
-        minmod = 0.5d0 * (sign(1.0d0, a) + sign(1.0d0, b)) * min(abs(a), abs(b))
-    end function minmod
+  ! Add to equations_1d module
+  function tvd_slope(a, b, limiter) result(slope)
+    real*8, intent(in) :: a, b
+    character(len=*), intent(in) :: limiter
+    real*8 :: slope
 
-    subroutine reconstruct_variables(p, pLx, pRx)
+    select case(trim(limiter))
+    case('minmod')
+      slope = minmod(a, b)
+    case('superbee')
+      if (a*b <= 0.0d0) then
+        slope = 0.0d0
+      else
+        slope = sign(1.0d0, a) * max(min(2.0d0*abs(a), abs(b)), min(abs(a), 2.0d0*abs(b)))
+      end if
+    case('mc')
+      slope = minmod3(2.0d0*b,0.5d0*(a+b), 2.0d0*a)
+    case default
+      slope = minmod(a, b)
+    end select
+  end function tvd_slope
+
+  subroutine reconstruct_variables(q, qL, qR)
     implicit none
-    real*8, intent(in)  :: p(neq, -1:nx+2)
-    real*8, intent(out) :: pLx(neq, -1:nx+2), pRx(neq, -1:nx+2)
-    
-    ! Todas las declaraciones al principio
-    integer :: i, k
-    real*8 :: slopex, smaxL, sminL
-    real*8 :: pL_temp, pR_temp
-    real*8 :: grr_avg, p_min, p_max
-    real*8 :: v_limit
-    real*8, parameter :: eps = 1.0d-12
-    real*8, parameter :: safety_factor = 0.3d0  ! Factor conservativo para minmod
+    real*8, intent(in)                           :: q(neq,-1:nx+1)
+    real*8, intent(out), dimension(neq, -1:nx+1) :: qL, qR
+    integer                                      :: i, k
+    real*8                                       :: smaxL, sminL, smaxR, sminR
 
     select case(trim(reconstruction_method))
-        case('Godunov') 
-            do i = 0, nx
-                pLx(:,i) = p(:,i)
-                pRx(:,i) = p(:,i+1)
-            end do
-            
-        case('minmod')
-            do k = 1, neq
-                do i = 0, nx
-                    ! Usar primer orden cerca de los bordes para mayor estabilidad
-                    if (i <= 1 .or. i >= nx-1) then
-                        pLx(k,i) = p(k,i)
-                        pRx(k,i) = p(k,i+1)
-                    else
-                        ! Calcular pendientes con protección
-                        smaxL = (p(k,i+1) - p(k,i)) / dx
-                        sminL = (p(k,i) - p(k,i-1)) / dx
-                        slopex = minmod(sminL, smaxL)
-                        
-                        ! Reconstruir valores con factor conservativo
-                        pL_temp = p(k,i) + safety_factor * slopex * dx
-                        pR_temp = p(k,i+1) - safety_factor * slopex * dx
-                        
-                        ! Aplicar límites físicos según la variable
-                        if (k == eq_de) then
-                            ! Densidad: siempre positiva
-                            pLx(k,i) = max(pL_temp, floor)
-                            pRx(k,i) = max(pR_temp, floor)
-                            
-                            ! No permitir variaciones extremas
-                            p_min = min(p(k,i), p(k,i+1))
-                            p_max = max(p(k,i), p(k,i+1))
-                            pLx(k,i) = max(p_min * 0.1d0, min(pLx(k,i), p_max * 5.0d0))
-                            pRx(k,i) = max(p_min * 0.1d0, min(pRx(k,i), p_max * 5.0d0))
-                            
-                        else if (k == eq_pr) then
-                            ! Presión: siempre positiva
-                            pLx(k,i) = max(pL_temp, floor)
-                            pRx(k,i) = max(pR_temp, floor)
-                            
-                            ! No permitir variaciones extremas
-                            p_min = min(p(k,i), p(k,i+1))
-                            p_max = max(p(k,i), p(k,i+1))
-                            pLx(k,i) = max(p_min * 0.1d0, min(pLx(k,i), p_max * 5.0d0))
-                            pRx(k,i) = max(p_min * 0.1d0, min(pRx(k,i), p_max * 5.0d0))
-                            
-                        else if (k == eq_vx) then
-                            ! Velocidad: límite causal
-                            pLx(k,i) = pL_temp
-                            pRx(k,i) = pR_temp
-                            
-                            ! Verificar límite causal usando grr local
-                            grr_avg = 0.5d0 * (grr(i) + grr(i+1))
-                            v_limit = sqrt(0.95d0 / max(grr_avg, eps))
-                            
-                            if (abs(pLx(k,i)) > v_limit) then
-                                pLx(k,i) = sign(v_limit, pLx(k,i))
-                            end if
-                            if (abs(pRx(k,i)) > v_limit) then
-                                pRx(k,i) = sign(v_limit, pRx(k,i))
-                            end if
-                        else
-                            ! Otras variables
-                            pLx(k,i) = pL_temp
-                            pRx(k,i) = pR_temp
-                        end if
-                    end if
-                end do
-            end do
-            
-        case default
-            ! Si no se reconoce el método, usar Godunov
-            do i = 0, nx
-                pLx(:,i) = p(:,i)
-                pRx(:,i) = p(:,i+1)
-            end do
-    end select
-    
-    ! Verificación final de consistencia física en todo el dominio
-    do i = 0, nx
-        ! Asegurar valores mínimos para densidad y presión
-        pLx(eq_de,i) = max(pLx(eq_de,i), floor)
-        pLx(eq_pr,i) = max(pLx(eq_pr,i), floor)
-        pRx(eq_de,i) = max(pRx(eq_de,i), floor)
-        pRx(eq_pr,i) = max(pRx(eq_pr,i), floor)
-        
-        ! Verificación final de velocidad causal
-        if (i < nx) then
-            if (grr(i) > eps) then
-                v_limit = sqrt(0.98d0 / grr(i))
-                if (abs(pLx(eq_vx,i)) > v_limit) then
-                    pLx(eq_vx,i) = sign(v_limit, pLx(eq_vx,i))
-                end if
-            end if
-        end if
-        
-        if (i > 0) then
-            if (grr(i) > eps) then
-                v_limit = sqrt(0.98d0 / grr(i))
-                if (abs(pRx(eq_vx,i)) > v_limit) then
-                    pRx(eq_vx,i) = sign(v_limit, pRx(eq_vx,i))
-                end if
-            end if
-        end if
-    end do
-    
-end subroutine reconstruct_variables
+    case('Godunov')
+      !$OMP PARALLEL DO PRIVATE(i)
+      do i = 0, nx-1
+        qL(:,i) = q(:, i )
+        qR(:,i) = q(:,i+1)
+        ! print*, qL(:,i), i
+      end do
+      !$OMP END PARALLEL DO
 
-    subroutine primu(p_local, u_local, i)
-        implicit none
-        real*8, intent(in)  :: p_local(neq)
-        real*8, intent(out) :: u_local(neq)
-        integer, intent(in) :: i
-        real*8 :: v, h, W, e
-        
-        v = p_local(eq_vx)
-        e = p_local(eq_pr) / (gam - 1.0d0) / p_local(eq_de)
-        h = 1.0d0 + e + p_local(eq_pr) / p_local(eq_de)  
-        W = 1.0d0 / sqrt(1.0d0 - grr(i) * v**2)
-
-        ! Variables conservativas 
-        u_local(eq_de) = sqrt(detgamma(i)) * p_local(eq_de) * W                                   
-        u_local(eq_pr) = sqrt(detgamma(i)) * p_local(eq_de) * h * W**2 * grr(i) * v              
-        u_local(eq_vx) = sqrt(detgamma(i)) * (p_local(eq_de) * h * W**2 - p_local(eq_pr) - p_local(eq_de) * W)  
-    end subroutine primu
-
-subroutine uprim(u_local, p_local, i)
-    real*8, intent(in)  :: u_local(neq)
-    real*8, intent(out) :: p_local(neq)
-    integer, intent(in) :: i
-    
-    ! Declaraciones
-    real*8 :: D, Sr, tau, sqrt_gamma
-    real*8 :: rho, press, v, W, h, e
-    real*8 :: press_guess, press_old, f, df, tol
-    real*8 :: term1, term2, denom, common_factor
-    real*8 :: v_max_allowed, press_max, press_min
-    real*8 :: safe_denom, safe_sqrt_arg
-    real*8, parameter :: eps = 1.0d-10
-    real*8, parameter :: max_iter = 50
-    real*8, parameter :: newton_tol = 1.0d-8
-    real*8, parameter :: huge_val = 1.0d10
-    integer :: iter
-    logical :: converged, use_fallback
-    
-    sqrt_gamma = sqrt(max(detgamma(i), eps))
-    
-    ! Extraer conservativas con verificación
-    D = u_local(eq_de)
-    Sr = u_local(eq_pr)
-    tau = u_local(eq_vx)
-    
-    ! Verificación de sanidad de las conservativas
-    use_fallback = .false.
-    
-    ! Verificar si D es razonable
-    if (abs(D) < eps * sqrt_gamma .or. abs(D) > huge_val) then
-        use_fallback = .true.
-    end if
-    
-    ! Verificar si tau es razonable
-    if (abs(tau) > huge_val .or. isnan(tau)) then
-        use_fallback = .true.
-    end if
-    
-    ! Verificar si Sr es razonable
-    if (abs(Sr) > huge_val .or. isnan(Sr)) then
-        use_fallback = .true.
-    end if
-    
-    ! Verificar consistencia básica: D debe ser positivo después de corrección
-    D = abs(D)
-    if (D < eps * sqrt_gamma) then
-        use_fallback = .true.
-    end if
-    
-    ! Si las conservativas son problemáticas, usar método de respaldo
-    if (use_fallback) then
-        p_local(eq_de) = max(floor, D / sqrt_gamma)
-        p_local(eq_pr) = floor
-        p_local(eq_vx) = 0.0d0
-        return
-    end if
-    
-    ! Límites físicos
-    press_min = floor
-    press_max = min(100.0d0 * D / sqrt_gamma, 0.1d0 * D / sqrt_gamma)
-    v_max_allowed = sqrt(0.95d0 / max(grr(i), eps))
-    
-    ! Estimación inicial conservativa
-    press_guess = max(press_min, min(0.001d0 * D / sqrt_gamma, press_max))
-    
-    ! Newton-Raphson con protecciones extremas
-    converged = .false.
-    do iter = 1, int(max_iter)
-        press_old = press_guess
-        
-        ! Verificar que pressure guess está en rango
-        if (press_guess < press_min .or. press_guess > press_max .or. &
-            isnan(press_guess) .or. press_guess <= 0.0d0) then
-            press_guess = press_min
-            cycle
-        end if
-        
-        ! Cálculos intermedios con protección extrema
-        common_factor = D + press_guess * sqrt_gamma + tau
-        
-        ! Verificar common_factor
-        if (abs(common_factor) < eps) then
-            press_guess = press_min
-            cycle
-        end if
-        
-        safe_denom = grr(i) * common_factor**2
-        if (abs(safe_denom) < eps) then
-            press_guess = press_min
-            cycle
-        end if
-        
-        safe_sqrt_arg = 1.0d0 - Sr**2 / safe_denom
-        if (safe_sqrt_arg <= eps) then
-            ! Velocidad superlumínica detectada
-            press_guess = max(press_min, 0.5d0 * press_guess)
-            cycle
-        end if
-        
-        term1 = safe_sqrt_arg
-        term2 = sqrt(term1)
-        
-        ! Verificar term2
-        if (term2 < eps .or. isnan(term2)) then
-            press_guess = press_min
-            cycle
-        end if
-        
-        ! Función objetivo simplificada y más robusta
-        f = press_guess - (gam - 1.0d0) * term1 * &
-            (tau + D * (1.0d0 - 1.0d0/term2)) / sqrt_gamma
-            
-        ! Derivada simplificada
-        if (term2 > eps .and. abs(common_factor) > eps) then
-            df = 1.0d0 + (gam - 1.0d0) * Sr**2 * sqrt_gamma / &
-                 (grr(i) * common_factor**2 * term2)
-        else
-            df = 1.0d0
-        end if
-        
-        ! Verificar derivada
-        if (abs(df) < eps .or. isnan(df)) then
-            press_guess = press_min
-            cycle
-        end if
-        
-        ! Paso Newton con limitación
-        press_guess = press_old - f / df
-        
-        ! Aplicar límites estrictos
-        press_guess = max(press_min, min(press_max, press_guess))
-        
-        ! Verificar convergencia
-        if (abs(press_old) > eps) then
-            tol = abs(press_guess - press_old) / abs(press_old)
-        else
-            tol = abs(press_guess - press_old)
-        end if
-        
-        if (tol < newton_tol .and. press_guess > press_min) then
-            converged = .true.
-            exit
-        end if
-        
-        ! Si no converge después de muchas iteraciones, usar mínimo
-        if (iter > max_iter/2 .and. tol > 1.0d-2) then
-            press_guess = press_min
-        end if
-    end do
-    
-    ! Si Newton-Raphson falló, usar método de respaldo
-    if (.not. converged .or. press_guess <= press_min) then
-        press_guess = press_min
-    end if
-    
-    ! Recuperar primitivas con máxima protección
-    press = max(press_guess, press_min)
-    
-    ! Velocidad con protección extrema
-    safe_denom = tau + D + press * sqrt_gamma
-    if (abs(safe_denom) > eps .and. abs(grr(i)) > eps) then
-        v = Sr / (safe_denom * grr(i))
-        
-        ! Verificar límite causal
-        if (abs(v) > v_max_allowed) then
-            v = sign(v_max_allowed, v)
-        end if
-        
-        ! Verificación adicional de velocidad
-        if (grr(i) * v**2 >= 1.0d0) then
-            v = sign(v_max_allowed, v)
-        end if
-    else
-        v = 0.0d0
-    end if
-    
-    ! Factor de Lorentz con protección
-    safe_sqrt_arg = 1.0d0 - grr(i) * v**2
-    if (safe_sqrt_arg > eps) then
-        W = 1.0d0 / sqrt(safe_sqrt_arg)
-        if (W > 100.0d0) then  ! Límite práctico
-            W = 100.0d0
-            v = sign(sqrt((W**2 - 1.0d0) / (W**2 * grr(i))), v)
-        end if
-    else
-        W = 1.0d0
-        v = 0.0d0
-    end if
-    
-    ! Densidad con protección
-    if (W > eps .and. sqrt_gamma > eps) then
-        rho = D / (W * sqrt_gamma)
-    else
-        rho = D / sqrt_gamma
-    end if
-    rho = max(rho, floor)
-    
-    ! Asignar primitivas finales
-    p_local(eq_de) = rho
-    p_local(eq_pr) = press
-    p_local(eq_vx) = v
-    
-    ! Verificación final de consistencia física
-    e = press / (max(eps, (gam - 1.0d0) * rho))
-    h = 1.0d0 + e + press / rho
-    
-    if (e < 0.0d0 .or. h <= 1.0d0 .or. rho < floor .or. &
-        isnan(e) .or. isnan(h) .or. isnan(rho) .or. &
-        isnan(press) .or. isnan(v)) then
-        ! Último recurso: valores de respaldo completamente seguros
-        p_local(eq_de) = max(floor, D / sqrt_gamma)
-        p_local(eq_pr) = floor
-        p_local(eq_vx) = 0.0d0
-    end if
-    
-end subroutine uprim
-
-
-subroutine advance_solution(dt)
-    real*8, intent(in) :: dt
-    integer :: i, rk, k
-    real*8 :: T00, Tr0, Trr
-    real*8 :: v_local, h_local, W_local, e_local
-    real*8 :: dt_safe, rho_local, press_local
-    real*8 :: max_speed, local_dt
-    real*8, parameter :: eps = 1.0d-12
-    real*8, parameter :: max_h = 100.0d0
-    real*8, parameter :: max_W = 100.0d0
-    
-    ! Verificar dt
-    dt_safe = min(dt, dx * 0.01d0)  ! Limitar dt
-    
-    ! Guardar estado inicial
-    up = u
-    
-    do rk = 1, 3
-        ! Verificar primitivas antes de reconstrucción
-        do i = 1, nx
-            if (p(eq_de,i) < floor .or. p(eq_pr,i) < floor .or. &
-                isnan(p(eq_de,i)) .or. isnan(p(eq_pr,i)) .or. isnan(p(eq_vx,i))) then
-                p(eq_de,i) = floor
-                p(eq_pr,i) = floor  
-                p(eq_vx,i) = 0.0d0
-            end if
-            
-            ! Verificar velocidad causal
-            if (grr(i) * p(eq_vx,i)**2 >= 1.0d0) then
-                p(eq_vx,i) = sign(sqrt(0.95d0/grr(i)), p(eq_vx,i))
-            end if
-        end do
-        
-        ! Reconstruct variables
-        call reconstruct_variables(p, pLx, pRx)
-
-        ! Calculate fluxes con verificación
+    case('TVD')
+      !$OMP PARALLEL DO PRIVATE(k,i,sminL,smaxL,sminR,smaxR)
+      ! q(:,-1) = 0.0d0
+      do k = 1, neq
         do i = 0, nx-1
-            ! Verificar estados reconstruidos
-            if (pLx(eq_de,i) < floor) pLx(eq_de,i) = floor
-            if (pLx(eq_pr,i) < floor) pLx(eq_pr,i) = floor
-            if (pRx(eq_de,i) < floor) pRx(eq_de,i) = floor
-            if (pRx(eq_pr,i) < floor) pRx(eq_pr,i) = floor
-            
-            call fluxes(pLx(:,i), pRx(:,i), fx(:,i), alpha(i), beta(i), grr(i), detgamma(i))
-            
-            ! Verificar que los flujos no sean infinitos
-            if (any(abs(fx(:,i)) > 1.0d10) .or. any(isnan(fx(:,i)))) then
-                fx(:,i) = 0.0d0
-            end if
+          ! Left state reconstruction
+          sminL = q(k,i) - q(k,i-1)
+          smaxL = q(k,i+1) - q(k,i)
+          qL(k,i) = q(k,i) + 0.5d0 * tvd_slope(sminL, smaxL, tvd_limiter)
+
+          ! Right state reconstruction
+          sminR = q(k,i+1) - q(k,i)
+          smaxR = q(k,i+2) - q(k,i+1)
+          qR(k,i) = q(k,i+1) - 0.5d0 * tvd_slope(sminR, smaxR, tvd_limiter)
         end do
+      end do
+      !$OMP END PARALLEL DO
 
-        ! Calcular RHS con máxima protección
-        do i = 1, nx-1
-            ! Extraer y verificar variables locales
-            rho_local = max(p(eq_de,i), floor)
-            press_local = max(p(eq_pr,i), floor)
-            v_local = p(eq_vx,i)
-            
-            ! Verificar velocidad causal
-            if (grr(i) * v_local**2 >= 1.0d0) then
-                v_local = sign(sqrt(0.95d0/grr(i)), v_local)
-            end if
-            
-            ! Calcular cantidades locales con protección
-            e_local = press_local / (max(eps, (gam - 1.0d0) * rho_local))
-            h_local = 1.0d0 + e_local + press_local / rho_local
-            h_local = max(1.0d0 + eps, min(h_local, max_h))
-            
-            W_local = 1.0d0 / sqrt(max(eps, 1.0d0 - grr(i) * v_local**2))
-            W_local = min(W_local, max_W)
+    end select
 
-            ! Verificar que las cantidades sean físicas
-            if (isnan(h_local) .or. isnan(W_local) .or. h_local <= 1.0d0) then
-                ! Usar valores de respaldo
-                h_local = 1.01d0
-                W_local = 1.0d0
-                v_local = 0.0d0
-            end if
+  end subroutine reconstruct_variables
 
-            ! Calcular tensor energía-momento con protección
-            call calculate_stress_energy_tensor(rho_local, press_local, v_local, &
-                                             W_local, h_local, i, T00, Tr0, Trr)
-            
-            ! Verificar componentes del tensor
-            if (isnan(T00) .or. isnan(Tr0) .or. isnan(Trr) .or. &
-                abs(T00) > 1.0d10 .or. abs(Tr0) > 1.0d10 .or. abs(Trr) > 1.0d10) then
-                T00 = rho_local
-                Tr0 = 0.0d0
-                Trr = press_local
-            end if
+end module reconstruction
 
-            ! Calcular fuentes geométricas
-            call calculate_geometric_sources(i, T00, Tr0, Trr, rhs(:,i))
-            
-            ! Verificar fuentes
-            if (any(isnan(rhs(:,i))) .or. any(abs(rhs(:,i)) > 1.0d10)) then
-                rhs(:,i) = 0.0d0
-            end if
+module equations
+  use variables
+  use metrics
+  implicit none
+  private
+  public :: primu, uprim, primfx, source
 
-            ! RHS completo con verificación de flujos
-            if (abs(fx(eq_de,i)) < 1.0d10 .and. abs(fx(eq_de,i-1)) < 1.0d10 .and. &
-                .not. isnan(fx(eq_de,i)) .and. .not. isnan(fx(eq_de,i-1))) then
-                rhs(eq_de,i) = -(fx(eq_de,i) - fx(eq_de,i-1)) / dx + rhs(eq_de,i)
-            else
-                rhs(eq_de,i) = 0.0d0
-            end if
-            
-            if (abs(fx(eq_pr,i)) < 1.0d10 .and. abs(fx(eq_pr,i-1)) < 1.0d10 .and. &
-                .not. isnan(fx(eq_pr,i)) .and. .not. isnan(fx(eq_pr,i-1))) then
-                rhs(eq_pr,i) = -(fx(eq_pr,i) - fx(eq_pr,i-1)) / dx + rhs(eq_pr,i)
-            else
-                rhs(eq_pr,i) = 0.0d0
-            end if
-            
-            if (abs(fx(eq_vx,i)) < 1.0d10 .and. abs(fx(eq_vx,i-1)) < 1.0d10 .and. &
-                .not. isnan(fx(eq_vx,i)) .and. .not. isnan(fx(eq_vx,i-1))) then
-                rhs(eq_vx,i) = -(fx(eq_vx,i) - fx(eq_vx,i-1)) / dx + rhs(eq_vx,i)
-            else
-                rhs(eq_vx,i) = 0.0d0
-            end if
-            
-            ! Limitar RHS para evitar cambios extremos
-            do k = 1, neq
-                if (abs(rhs(k,i) * dt_safe) > abs(u(k,i))) then
-                    rhs(k,i) = sign(abs(u(k,i)) / dt_safe * 0.1d0, rhs(k,i))
-                end if
-            end do
-        end do
+contains
 
-        ! Frontera externa 
-        rhs(:,nx) = 0.0d0
+  subroutine primu(q,y,xi) 
+    implicit none
+    real*8, intent(in) :: q(:), xi
+    real*8, intent(out) :: y(:)
+    real*8 :: vv, h, W, grr, detgamma
 
-        ! RK3 step con verificación
-        if (rk == 1) then
-            do i = 1, nx
-                do k = 1, neq
-                    if (.not. isnan(rhs(k,i)) .and. abs(rhs(k,i)) < 1.0d10) then
-                        u(k,i) = up(k,i) + dt_safe * rhs(k,i)
-                    else
-                        u(k,i) = up(k,i)
-                    end if
-                end do
-            end do
-        else if (rk == 2) then
-            do i = 1, nx
-                do k = 1, neq
-                    if (.not. isnan(rhs(k,i)) .and. abs(rhs(k,i)) < 1.0d10) then
-                        u(k,i) = 0.75d0 * up(k,i) + 0.25d0 * u(k,i) + 0.25d0 * dt_safe * rhs(k,i)
-                    else
-                        u(k,i) = 0.75d0 * up(k,i) + 0.25d0 * u(k,i)
-                    end if
-                end do
-            end do
-        else
-            do i = 1, nx
-                do k = 1, neq
-                    if (.not. isnan(rhs(k,i)) .and. abs(rhs(k,i)) < 1.0d10) then
-                        u(k,i) = up(k,i)/3.0d0 + 2.0d0/3.0d0 * (u(k,i) + dt_safe * rhs(k,i))
-                    else
-                        u(k,i) = up(k,i)/3.0d0 + 2.0d0/3.0d0 * u(k,i)
-                    end if
-                end do
-            end do
-        end if
+    ! q = Variables primitivas
+    ! y = Variables conservativas
+    ! xi = posición de la celda actual
 
-        ! Condiciones de frontera
-        call apply_inner_boundary(u)
-        
-        ! Recuperar primitivas con verificación
-        do i = -1, nx
-            call uprim(u(:,i), p(:,i), i)
-            
-            ! Verificación post-uprim
-            if (p(eq_de,i) < floor .or. p(eq_pr,i) < floor .or. &
-                isnan(p(eq_de,i)) .or. isnan(p(eq_pr,i)) .or. isnan(p(eq_vx,i))) then
-                p(eq_de,i) = floor
-                p(eq_pr,i) = floor
-                p(eq_vx,i) = 0.0d0
-                call primu(p(:,i), u(:,i), i)
-            end if
-        end do
+    call calculate_metric(xi, grr=grr, detgamma=detgamma)
+
+    vv = q(eq_vx)**2*grr
+    h = 1d0 + g1 * q(eq_pr)/q(eq_de)
+    W = 1d0 / sqrt(1d0 - vv)
+
+    y(eq_de) = q(eq_de) * W 
+    y(eq_pr) = q(eq_de) * h * W**2 - q(eq_pr)
+    y(eq_vx) = q(eq_de) * h * W**2 * q(eq_vx) * grr
+
+    y = y*sqrt(detgamma)
+  end subroutine primu
+
+  subroutine uprim(y,q,xi)
+    implicit none
+    real*8, intent(in) :: y(:), xi
+    real*8, intent(out) :: q(:)
+    real*8 :: lor, V, fn, dV
+    real*8 :: grr, detgamma
+    real*8 :: floor = 1d-16
+
+    ! y = Variables conservativas
+    ! q = Variables primitivas
+    ! xi = posición de la celda actual
+
+    lor = rtsafe(y,xi)
+    call VdV(lor, y, V, dV)
+    call calculate_metric(xi, grr=grr, detgamma=detgamma)
+
+    q(eq_de) = y(eq_de) / lor
+    q(eq_vx) = y(eq_vx) / (V * grr)
+    q(eq_pr) = V - y(eq_pr)
+
+    q(eq_de:eq_pr) = q(eq_de:eq_pr) / sqrt(detgamma)
+
+    q(eq_de) = max(q(eq_de), floor)
+    q(eq_pr) = max(q(eq_pr), floor)
+
+    if (q(eq_de) <= 0d0 .or. q(eq_pr) <= 0d0 .or. abs(q(eq_vx)) >= 1d0) then
+      print *, "Error: Valores no físicos en uprim", q, lor
+      stop
+    end if 
+  end subroutine uprim
+
+  subroutine VdV(W,y,V,dV)
+    real*8, intent(in) :: W, y(:)
+    real*8, intent(out) :: V, dV
+    real*8 :: denom
+
+    ! W = Factor de Lorentz 
+    ! y = Variables conservativas
+    ! V = V(W)
+    ! dV = dV/dW
+
+    denom = g1 * W**2 - 1d0
+    V = (g1 * W**2 * y(eq_pr) - y(eq_de) * W) / denom
+    dV = (g1 * W * (y(eq_de) * W - 2d0 * y(eq_pr)) + y(eq_de)) / denom**2
+  end subroutine VdV
+
+  subroutine funcd(W, y, x_i, fn, df)
+    real*8, intent(in) :: W, y(:), x_i
+    real*8, intent(out) :: fn, df
+    real*8 :: V, dV, grr
+
+    ! W = Factor de Lorentz
+    ! y = Variables conservativas
+    ! x_i = posicion de la celda actual
+    ! fn = f(W)
+    ! df = f'(W)
+
+    call calculate_metric(x_i, grr=grr)
+    call VdV(W,y(:),V,dV)
+
+    fn = V**2*(W**2-1d0)/W**2-y(eq_vx)**2/grr
+    df = 2*V*(dV*(W**3 - W) + V)/(W**3)
+  end subroutine funcd
+
+  function rtsafe(y,x_i) result(root)
+    implicit none
+    real*8, intent(in) :: y(:), x_i
+    real*8 :: x1 = 1.0d0, x2 = 1.0d3, xacc = 1.0d-8
+    real*8 :: root
+    integer, parameter :: MAXIT = 100000
+    integer :: j
+    real*8 :: df, diffx, diffxold, f, fh, fl, temp, xh, xl
+    
+    call funcd(x1, y, x_i, fl, df)
+    call funcd(x2, y, x_i, fh, df)
+
+    if ((fl > 0.0 .and. fh > 0.0) .or. (fl < 0.0 .and. fh < 0.0)) then
+      print *, fl, fh, 'root must be bracketed in rtsafe'
+      stop
+    end if
+    
+    if (fl == 0.0) then
+      root = x1
+      return
+    else if (fh == 0.0) then
+      root = x2
+      return
+    end if
+    
+    if (fl < 0.0) then
+      xl = x1
+      xh = x2
+    else
+      xh = x1
+      xl = x2
+    end if
+    
+    root = 0.5*(x1 + x2)
+    diffxold = abs(x2 - x1)
+    diffx = diffxold
+    call funcd(root, y, x_i, f, df)
+    
+    do j = 1, MAXIT
+      if (((root - xh)*df - f)*((root - xl)*df - f) > 0.0 .or. &
+          abs(2.0*f) > abs(diffxold*df)) then
+        diffxold = diffx
+        diffx = 0.5*(xh - xl)
+        root = xl + diffx
+        if (xl == root) return 
+      else
+        diffxold = diffx
+        diffx = f/df
+        temp = root
+        root = root - diffx
+        if (temp == root) return 
+      end if
+      
+      if (abs(diffx) < xacc) return 
+      
+      call funcd(root, y, x_i, f, df)
+      
+      if (f < 0.0) then
+        xl = root
+      else
+        xh = root
+      end if
+
     end do
-end subroutine advance_solution
+
+    print *, 'rtsafe exceeding maximum iterations', abs(diffx), root
+    stop
+  end function rtsafe
+
+  subroutine primfx(q,f,ri)
+    implicit none
+    real*8, intent(in) :: q(:), ri
+    real*8, intent(out) :: f(:)
+    real*8 :: vv, h, W, v_ef
+    real*8 :: grr, alpha, beta, detgamma
+
+    ! q = Variables primitivas
+    ! f = Flujos
+    ! ri = posición de la interfaz actual
+
+    call calculate_metric(ri, grr=grr, alpha=alpha, beta=beta, detgamma=detgamma)
+
+    vv = q(eq_vx)**2*grr
+    h = 1d0 + g1 * q(eq_pr)/q(eq_de)
+    W = 1d0 / sqrt(1d0 - vv)
+    v_ef = alpha*q(eq_vx)- beta ! alpha*v^r - beta^r
+
+    f(eq_de) = q(eq_de) * W * v_ef
+    f(eq_pr) = q(eq_de) * h * W**2 * v_ef + q(eq_pr)*beta
+    f(eq_vx) = q(eq_de) * h * W**2 * q(eq_vx) * grr * v_ef + alpha*q(eq_pr)
+
+    f = f*sqrt(detgamma)
+
+  end subroutine primfx
+
+  subroutine source(q, src, ri)
+  implicit none
+  real*8, intent(in) :: q(:), ri
+  real*8, intent(out) :: src(:)
+  real*8 :: T00, Tr0, Trr, Tthth, Tphph
+  real*8 :: vv, h, W, v_ef, chr(0:3,0:3,0:3)
+  real*8 :: aux1, aux2
+  real*8 :: grr, alpha, beta, dlnalpha, detgamma, gthth, gphph
+
+  ! q = Variables primitivas
+  ! ri = posición de la celda actual
+  ! src = Términos fuente
+
+  call calculate_stress_energy_tensor(q, ri, T00, Tr0, Trr, Tthth, Tphph)
+  call calculate_christoffel_symbols(ri, chr)
+  call calculate_metric(ri, grr=grr, alpha=alpha, beta=beta, dlnalpha=dlnalpha, detgamma=detgamma, gthth=gthth, gphph=gphph)
+
+  aux1 = -alpha**2 + grr*beta**2
+
+  src(eq_de)  = 0.0d0
+  src(eq_vx)  = T00 * (aux1*chr(0,0,1) + beta*grr*chr(1,0,1)) &
+              + Tr0 * (aux1*chr(0,1,1) + beta*grr*(chr(0,0,1) + chr(1,1,1)) + grr*chr(1,0,1)) &
+              + Trr * (grr*chr(1,1,1) + beta*grr*chr(0,1,1)) &
+              + Tthth *gthth*chr(2,1,2) + Tphph * gphph*chr(3,1,3)
+  src(eq_pr)  = alpha * (-T00*chr(0,0,0) + Tr0 * (dlnalpha - 2.0d0*chr(0,0,1)) &
+              - (Trr * chr(0,1,1) + Tthth * chr(0,2,2) + Tphph * chr(0,3,3)) )
+  src = src*alpha*sqrt(detgamma)
+  end subroutine source
+
 end module equations
 
-
-! ----------------------------------------------------------------------------------
-! Initial_conditions: Este módulo se encarga de configurar las condiciones iniciales 
-!                     y parámetros del problema de evolución HD, además deque el 
-!                     usurario elija un método de reconstrucción.
-! ---------------------------------------------------------------------------------
-module initial_conditions
-    use variables
-    use metrics
-    use equations, only: primu
-    implicit none
-    private
-    public :: choose_reconstruction_method, initialize_problem, set_initial_conditions
+module flujos
+  use equations
+  use variables
+  use metrics
+  implicit none
+  private
+  public :: fluxes
 
 contains
 
-subroutine choose_reconstruction_method()
-        integer :: choice
+  subroutine fluxes(ql, qr, rl, rr, f)
+    real*8, intent(in) :: ql(:), qr(:), rl, rr
+    real*8, intent(out) :: f(:)
+    real*8 :: ul(neq), ur(neq), fl(neq), fr(neq)
+    real*8 :: ap, am, cflmin, cflmax, cfrmin, cfrmax
 
-        print *, ""
-        print *, "======================================"
-        print *, "Choose reconstruction method:"
-        print *, "======================================"
-        print *, "1. Godunov (1st order)"
-        print *, "2. Minmod (2nd order)"
-        print *, "======================================"
-        print *, "Enter your choice (1-2): "
-        read *, choice
+    ! ql = Variables primitivas a la izquierda de la interfaz
+    ! qr = Variables primitivas a la derecha de la interfaz
+    ! ri = posición de la interfaz actual
+    ! f  = Flujos en la interfaz
 
-        select case(choice)
-        case(1)
-            reconstruction_method = 'Godunov'
-            print *, "Selected: Godunov (1st order) reconstruction"
-        case(2)
-            reconstruction_method = 'minmod'
-            print *, "Selected: Minmod (2nd order) reconstruction"
-        case default
-            print *, "Invalid choice. Using default method (Minmod)."
-            reconstruction_method = 'minmod'
-        end select
+    call primfx(ql, fl, rl)
+    call primfx(qr, fr, rr)
 
-        print *, "======================================"
-        print *, ""
-    end subroutine choose_reconstruction_method
+    call primu(ql, ul, rl)
+    call primu(qr, ur, rr)
 
-    subroutine initialize_problem()
-        implicit none
-        integer :: i
-        !character(len=20) :: initial_case
+    call soundcfp(ql, rl, cflmin, cflmax)
+    call soundcfp(qr, rr, cfrmin, cfrmax)
 
-        ! Parámetros 
-        nx = 1000
-        nt = 200000
-        xmin = 1.0d0
-        xmax = 51.0d0
-        CFL = 0.25d0
-        floor = 1.0d-10
-        gam = 4.0d0/3.0d0 
-        Ma = 1.0d0
+    ap = max(0d0, cflmax, cfrmax)
+    am = min(0d0, cflmin, cfrmin)
 
-        final_time = 1000.0d0  ! Tiempo suficiente para evolución
+    f = (ap*fl - am*fr + ap*am*(ur - ul) ) / (ap - am)
+  end subroutine fluxes
 
-        ! Intervalos 
-        t1 = 100
-        t2 = 1000
+  subroutine soundcfp(q, ri, xmin, xmax)
+    implicit none
+    double precision, intent(in) :: q(:), ri
+    double precision, intent(out) :: xmin,xmax
+    double precision :: cs, cs2, aux1, aux2
+    double precision :: eig1, eig2, eig3, h, vv
+    double precision :: grr, alpha, beta
 
-        ! Calcula dx
-        dx = (xmax - xmin)/dble(nx)
+    ! q = Variables primitivas
+    ! ri = posición de la interfaz actual
+    ! xmin, xmax = velocidades características
 
-        ! Inicializa la malla 
-        allocate(x(0:nx))  
-        do i = 0, nx
-            x(i) = xmin + dble(i) * dx
-        end do
+    call calculate_metric(ri, grr=grr, alpha=alpha, beta=beta)
 
-        !Extender arrays para celdas fantasma
-        deallocate(x)
-        allocate(x(-1:nx+2))
-        do i = -1, nx+2
-            x(i) = xmin + dble(i) * dx
-        end do
+    h = 1d0 + g1*q(eq_pr)/q(eq_de)
+    vv = q(eq_vx)**2*grr
+    cs2 = adb_idx * q(eq_pr)/q(eq_de)/h
+    cs = sqrt(cs2)
 
-        ! Aloca memoria para arrays
-        allocate(u(neq,-1:nx+2), up(neq,-1:nx+2))
-        allocate(p(neq,-1:nx+2), fx(neq,-1:nx+2))
-        allocate(rhs(neq,-1:nx+2))
-        allocate(pLx(neq,-1:nx+2), pRx(neq,-1:nx+2))
-        
-        ! Variables geométricas
-        allocate(grr(-1:nx+2))
-        allocate(alpha(-1:nx+2), dlnalpha(-1:nx+2))
-        allocate(beta(-1:nx+2))
-        allocate(detgamma(-1:nx+2))
+    aux1 = alpha/(1d0 - vv*cs2)
+    aux2 = cs * sqrt( (1d0 - vv) * (alpha/grr/aux1 - q(eq_vx)**2*(1d0 - cs2)) )
 
-        ! Inicializa la métrica
-        call set_metric(x, grr, alpha, dlnalpha, beta, detgamma, 'Schwarzschild_EF')
+    eig1 = alpha*q(eq_vx) - beta
+    eig2 = aux1*(q(eq_vx)*(1d0 - cs2) + aux2) - beta
+    eig3 = aux1*(q(eq_vx)*(1d0 - cs2) - aux2) - beta
 
-        ! Elegir método de reconstrucción
-        call choose_reconstruction_method()
+    xmax = max(0d0, eig1, eig2, eig3)
+    xmin = min(0d0, eig1, eig2, eig3)
 
-        call set_initial_conditions('michel')
-    end subroutine initialize_problem
+  end subroutine soundcfp
 
-    subroutine set_initial_conditions(initial_case)
-        implicit none
-        character(len=*), intent(in) :: initial_case
-        integer :: i
-        real*8 :: e_local, h_local, W_local, cs_local
+end module flujos
 
-        select case(trim(initial_case))
-            case('michel')
-                ! Parámetros iniciales
-                rho_ini = 1.0d-4
-                v_infty = -0.2d0
-                cs_infty = 0.1d0
-
-                do i = -1, nx+2
-                    ! Variables primitivas 
-                    p(eq_de,i) = rho_ini  ! densidad
-                    p(eq_pr,i) = cs_infty**2 * rho_ini * (gam-1.0d0) / &
-                                (gam*(gam-1.0d0) - cs_infty**2*gam)  ! presión 
-                    p(eq_vx,i) = v_infty/sqrt(grr(i))  ! velocidad 
-                    
-                    ! Verificar que las primitivas son físicas
-                    e_local = p(eq_pr,i) / (gam - 1.0d0) / p(eq_de,i)
-                    h_local = 1.0d0 + e_local + p(eq_pr,i) / p(eq_de,i)
-                    W_local = 1.0d0 / sqrt(1.0d0 - grr(i) * p(eq_vx,i)**2)
-                    cs_local = sqrt(p(eq_pr,i) * gam * (gam - 1.0d0) / &
-                                  (p(eq_pr,i) * gam + p(eq_de,i) * (gam - 1.0d0)))
-                    
-                    ! Calcula variables conservativas 
-                    call primu(p(:,i), u(:,i), i)
-                end do
-        end select
-
-        ! Copia inicial a up 
-        up = u
-        
-        ! Inicializar tiempo
-        t = 0.0d0
-        
-        print *, "Condiciones iniciales establecidas:"
-        print *, "  Densidad inicial: ", rho_ini
-        print *, "  Velocidad en infinito: ", v_infty  
-        print *, "  Velocidad del sonido en infinito: ", cs_infty
-        print *, "  Gamma: ", gam
-        print *, "  Masa del agujero negro: ", Ma
-        
-    end subroutine set_initial_conditions
-
-end module initial_conditions
-
-! ----------------------------------------------------------------------------------
-! Output: Este módulo se encarga de la gestión de salida de datos en la simulación 
-!         de GRHD en 1D. Contiene rutinas para inicializar directorios de salida y
-!         guardar el estado de la simulación en archivos.
-! ---------------------------------------------------------------------------------
 module output
-    use variables
-    implicit none
-    private
-    public :: save_data, initialize_output
+  use variables
+  implicit none
+  private
+  public :: save_data, save_data_at_time
 
-contains
-    subroutine initialize_output()
-        implicit none
-        character(len=100) :: command
-        
-        ! Crea directorio para output
-        write(command, '(3a)') 'mkdir -p output/', trim(reconstruction_method)
-        call system(command)
-    end subroutine initialize_output
+  contains
 
-    subroutine save_data(it, time)
-        implicit none
-        integer, intent(in) :: it
-        real*8, intent(in) :: time
-        character(len=100) :: filename
-        integer :: i
-        real*8 :: e_local
+  subroutine save_data(filename)
+    character(len=*), intent(in) :: filename
+    integer :: eq, i, unit
+    character(len=100) :: full_filename
 
-        ! Genera nombre de archivo
-        write(filename,'(3a,i6.6,a)') 'output/', trim(reconstruction_method), '/data_', it, '.dat'
+    full_filename = trim(output_folder) // trim(reconstruction_method) // '/' // trim(filename)
 
-        ! Abre archivo
-        open(unit=10, file=filename, status='replace')
+    print *, 'writing output file:', trim(filename)
+    unit = 10
 
-        ! Escribe encabezado
-        write(10,*) '# Simulación GRHD 1D en métrica de Schwarzschild (EF)'
-        write(10,*) '# Método de reconstrucción: ', trim(reconstruction_method)
-        write(10,*) '# Tiempo = ', time
-        write(10,*) '# Columnas: x, densidad, presión, velocidad, energía_interna'
-        write(10,*) '#'
+    open(unit, file=full_filename, status='replace', action='write', form='formatted')
 
-        ! Escribe datos
-        do i = 1, nx
-            e_local = p(eq_pr,i) / (gam - 1.0d0) / p(eq_de,i)
-            write(10,'(5E20.12)') x(i), p(eq_de,i), p(eq_pr,i), p(eq_vx,i), e_local
-        end do
+    do eq = 1, neq
+      do i = 0, nx
+        write(unit, *) p(eq, i)
+      end do
+    end do
 
-        close(10)
-    end subroutine save_data
+    close(unit)
+
+  end subroutine save_data
+
+  subroutine save_data_at_time(time)
+    real*8, intent(in) :: time
+    character(len=50) :: filename
+
+    write(filename, '(A,F0.1,".dat")') trim(output_prefix), time
+    call save_data(filename)
+    print *, 'Datos guardados para t =', time
+  end subroutine save_data_at_time
 
 end module output
 
-! ---------------------------------------------------------------------------------
-!                                   PROGRAMA PRINCIPAL
-! 
-! ---------------------------------------------------------------------------------
-program GRHD_1D
-    use variables
-    use metrics
-    use equations
-    use MODfluxes
-    use initial_conditions
-    use boundary_conditions  
-    use output
-    implicit none
+program grhd
+  use variables
+  use metrics
+  use initialization
+  use equations
+  use flujos
+  use reconstruction
+  use output
+  use omp_lib
+  implicit none
 
-    integer :: it
-    real*8 :: time
+  real*8 :: start_time, end_time, integration_time
+  integer :: n_steps, i, rk, k
 
-    ! Inicialización
-    print *, "================================================================================"
-    print *, "                 CODE General Relativity Hydrodinamics  (GRHD)                 "
-    print *, "================================================================================"
-    print *, " "
-    call initialize_problem()
-    call initialize_output()
+  integration_time = 0d0
+  n_steps = 0
+  start_time = omp_get_wtime()
 
-    ! Guarda condición inicial
-    time = 0.0d0
-    print *, "Guardando condición inicial..."
-    call save_data(0, time)
+  call initialize_problem()
 
-    ! Loop principal de evolución
-    print *, "Comenzando evolución temporal..."
-    print *, "----------------------------------------"
-    print *, " Iteración |    Tiempo    |   % Completado"
-    print *, "----------------------------------------"
+  !$OMP PARALLEL DO PRIVATE(i)
+  do i = 0, nx
+    call primu(p(:,i), up(:,i), x(i))
+  end do
+  !$OMP END PARALLEL DO
 
-    do it = 1, nt
-        dt = CFL * dx
-        call advance_solution(dt)
-        time = time + dt
+  call save_data_at_time(0.0d0)
+  next_save_time = save_interval
+  dt = CFL * dx
 
-        !Progreso en consola
-        if (mod(it, t1) == 0) then
-            write(*, '(I10,F13.6,E11.3,F8.1,"%")') &
-                it, time, dt, (time/final_time)*100.0d0
-        endif
+  do while (integration_time < final_time)
+    n_steps = n_steps + 1
 
-        if (time >= final_time) then
-            print *, "Simulación completada!"
-            exit
-        end if
-    end do
-
-    if (mod(it, t2) /= 0) then
-        call save_data(it, time)
+    if (mod(n_steps,1) == 0) then
+      print *, 'Step ', n_steps, ' - Time ', integration_time, ' (', real(integration_time/final_time*100), '%)'
     end if
 
-    call deallocate_arrays()
-    print *, "----------------------------------------"
-    print *, "Simulación finalizada correctamente"
-    print *, "Tiempo final alcanzado: ", time
-    print *, "Número total de iteraciones: ", it
+    if (integration_time >= next_save_time) then
+      call save_data_at_time(next_save_time)
+      last_save_time = next_save_time
+      next_save_time = next_save_time + save_interval
+    end if
 
-contains
-    subroutine deallocate_arrays()
-        implicit none
-        
-        print *, "Liberando memoria..."
-        deallocate(x, u, up, p, fx, rhs, pLx, pRx)
-        deallocate(grr, alpha, dlnalpha, beta, detgamma)
-        print *, "Memoria liberada correctamente"
-    end subroutine deallocate_arrays
+    u = up
 
-end program GRHD_1D
+  integration_time = integration_time + dt
 
+    do rk = 1, 3
+      call reconstruct_variables(p, pL, pR)
 
+      !$OMP PARALLEL DO PRIVATE(i)
+      do i = 0, nx-1
+        call fluxes(pL(:,i), pR(:,i), x(i), x(i+1), fx(:,i))
+        call source(p(:,i), s(:,i), x(i))
+      end do
+      !$OMP END PARALLEL DO
 
+      !$OMP PARALLEL DO PRIVATE(i)
+      do i = 1, nx-1
+        rhs(:,i) = -(fx(:,i) - fx(:,i-1))/ dx + s(:,i)
+      end do
+      !$OMP END PARALLEL DO
 
+      ! Inyección permanente en la frontera externa
+      rhs(:,nx) = 0.0d0
+
+      if (rk == 1) then
+        up = u + rhs * dt
+      else if (rk == 2) then
+        up = 0.75d0 * u + 0.25d0 * (up + rhs * dt)
+      else
+        up = (u + 2.0d0*(up + rhs * dt))/3.0d0
+      end if
+
+      call boundary_conditions(up)
+
+      !$OMP PARALLEL DO PRIVATE(i)
+      do i = 0, nx
+        call uprim(up(:,i), p(:,i), x(i))
+      end do
+      !$OMP END PARALLEL DO
+
+    end do
+  end do
+
+  call save_data_at_time(integration_time)
+
+  end_time = omp_get_wtime()
+
+  ! Imprimir el tiempo total de ejecución
+  print *, 'Execution time:', end_time - start_time, 'seconds'
+
+end program grhd
